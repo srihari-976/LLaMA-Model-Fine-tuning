@@ -1,105 +1,108 @@
 import os
-import torch
+import sys
+
+# Ensure project root is on path for config/utils imports
+_project_root = os.path.dirname(os.path.abspath(__file__))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 from datasets import load_dataset
+from peft import get_peft_model, prepare_model_for_kbit_training
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
+    DataCollatorForLanguageModeling,
+    Trainer,
     TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer
 
-MODEL_NAME = os.environ.get("BASE_MODEL", "meta-llama/Llama-3.2-3B")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "./llama3-qlora-out")
+from config import (
+    BASE_MODEL,
+    DATASET_FILE,
+    LORA_CONFIG,
+    MAX_SEQ_LENGTH,
+    OUTPUT_DIR,
+    SEED,
+    TRAINING_ARGS,
+)
+from utils import (
+    EarlyStoppingCallback,
+    compute_warmup_steps,
+    format_example,
+    load_base_model,
+    load_train_eval_datasets,
+    set_seed,
+    tokenize_for_training,
+    validate_dataset_schema,
+)
+
+set_seed(SEED)
+
+
+MODEL_NAME = os.environ.get("BASE_MODEL", BASE_MODEL)
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", OUTPUT_DIR)
 DATASET = os.environ.get("DATASET", "")
-DATASET_FILE = os.environ.get("DATASET_FILE", "srihari_dataset.json")
+DATASET_FILE = os.environ.get("DATASET_FILE", DATASET_FILE)
 
-bnb_config = BitsAndBytesConfig(
-    load_in_8bit=True,
-    llm_int8_enable_fp32_cpu_offload=True,
-    llm_int8_threshold=6.0,
-)
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+def load_datasets():
+    """Return (train_dataset, eval_dataset) formatted as 'text'."""
+    if DATASET:
+        raw = load_dataset(DATASET, split="train")
+        validate_dataset_schema(raw)
+        formatted = raw.map(format_example, remove_columns=raw.column_names)
+        split = formatted.train_test_split(test_size=0.1, seed=SEED)
+        return split["train"], split["test"]
+    return load_train_eval_datasets(DATASET_FILE)
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    quantization_config=bnb_config,
-    device_map="auto",
-    trust_remote_code=True,
-    torch_dtype=torch.float16,
-)
 
-model = prepare_model_for_kbit_training(model)
+def main():
+    # ── Load model (8-bit quantized) + tokenizer ──────────────────────────
+    model, tokenizer = load_base_model(model_name=MODEL_NAME)
+    model = prepare_model_for_kbit_training(model)
+    model = get_peft_model(model, LORA_CONFIG)
+    model.print_trainable_parameters()
 
-peft_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    lora_dropout=0.1,
-    bias="none",
-    task_type="CAUSAL_LM",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-)
-model = get_peft_model(model, peft_config)
-model.print_trainable_parameters()
+    # ── Datasets ──────────────────────────────────────────────────────────
+    train_dataset, eval_dataset = load_datasets()
+    tokenized_train = tokenize_for_training(train_dataset, tokenizer, MAX_SEQ_LENGTH)
+    tokenized_eval = tokenize_for_training(eval_dataset, tokenizer, MAX_SEQ_LENGTH)
 
-def format_example(example):
-    instr = example.get("instruction", "")
-    inp = example.get("input", "")
-    out = example.get("output", "")
-    if inp:
-        prompt = f"### Instruction:\n{instr}\n\n### Input:\n{inp}\n\n### Response:\n{out}"
-    else:
-        prompt = f"### Instruction:\n{instr}\n\n### Response:\n{out}"
-    return {"text": prompt}
+    # ── Training arguments (base from config + eval settings) ─────────────
+    training_args = TrainingArguments(
+        **{
+            **TRAINING_ARGS.to_dict(),
+            "output_dir": OUTPUT_DIR,
+            "eval_strategy": "steps",
+            "eval_steps": 50,
+            "warmup_steps": compute_warmup_steps(
+                len(tokenized_train),
+                batch_size=1,
+                gradient_accumulation_steps=8,
+                num_epochs=5,
+            ),
+        }
+    )
 
-if DATASET:
-    raw_dataset = load_dataset(DATASET, split="train")
-elif os.path.exists(DATASET_FILE):
-    raw_dataset = load_dataset("json", data_files=DATASET_FILE, split="train")
-else:
-    print(f"{DATASET_FILE} not found. Falling back to Alpaca.")
-    raw_dataset = load_dataset("yahma/alpaca-cleaned", split="train")
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-train_dataset = raw_dataset.map(format_example, remove_columns=raw_dataset.column_names)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_eval,
+        processing_class=tokenizer,
+        data_collator=data_collator,
+        callbacks=[EarlyStoppingCallback(patience=2)],
+    )
 
-training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=8,
-    num_train_epochs=5,
-    learning_rate=1.5e-4,
-    lr_scheduler_type="cosine",
-    warmup_ratio=0.05,
-    fp16=True,
-    gradient_checkpointing=True,
-    logging_steps=5,
-    save_strategy="epoch",
-    save_total_limit=2,
-    optim="paged_adamw_8bit",
-    report_to="none",
-    max_grad_norm=0.3,
-    dataloader_pin_memory=False,
-    remove_unused_columns=False,
-    load_best_model_at_end=False,
-)
+    # ── Train ─────────────────────────────────────────────────────────────
+    trainer.train()
+    trainer.save_model(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    print(f"Done. Model saved to {OUTPUT_DIR}")
+    print(
+        f"Dataset size: {len(tokenized_train)} training + {len(tokenized_eval)} eval examples"
+    )
 
-trainer = SFTTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    dataset_text_field="text",
-    max_seq_length=512,
-    tokenizer=tokenizer,
-    peft_config=peft_config,
-)
 
-trainer.train()
-trainer.save_model(OUTPUT_DIR)
-tokenizer.save_pretrained(OUTPUT_DIR)
-print(f"Done. Model saved to {OUTPUT_DIR}")
-print(f"Dataset size: {len(train_dataset)} examples")
+if __name__ == "__main__":
+    main()
