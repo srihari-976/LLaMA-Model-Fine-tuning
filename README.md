@@ -4,6 +4,8 @@ Fine-tune LLaMA 3.2 3B on **4GB RTX 3050** (8-bit QLoRA) to answer anything abou
 
 Trained on **155 Q&A pairs** from GitHub, LinkedIn, Google Scholar (3 IEEE papers), personal website, ORCID, and 42+ projects.
 
+The model doesn't just retrieve facts — it learns a **persona**. Every answer is written in first person ("I'm Srihari R...", "I built..."), so the fine-tuned model speaks as Srihari, adopting his voice, tone, and style across all responses.
+
 ## Quick Start
 
 ```bash
@@ -35,20 +37,26 @@ python inference_qlora.py "What projects have you built?"  # one-off Q&A
 | `ds_config.json` | DeepSpeed CPU-offload config (optional, for larger full-FT models) |
 | `requirements.txt` | PyTorch, transformers, peft, bitsandbytes, streamlit, etc. |
 
-## Full Fine-Tuning (whole model)
+## Why QLoRA? (Full Fine-Tuning vs. QLoRA)
 
-**Reality check for a 4GB RTX 3050:** full fine-tuning trains *every* weight. Memory needed ≈
-4-6 bytes per parameter on top of 2-byte weights. That means:
+Full fine-tuning trains *every* weight — memory needed ≈ 4-6 bytes per parameter on top
+of 2-byte weights. On a 4GB RTX 3050, that rules out most models:
 
-| Model | Params | Est. VRAM | Fits 4GB? |
-|-------|--------|-----------|-----------|
-| GPT-2 (`gpt2`) | 124M | ~0.9 GB | ✅ (default) |
+| Model | Params | Est. VRAM (Full FT) | Fits 4GB? |
+|-------|--------|----------------------|-----------|
+| GPT-2 (`gpt2`) | 124M | ~0.9 GB | ✅ |
 | Pythia-160m (`EleutherAI/pythia-160m`) | 162M | ~1.2 GB | ✅ |
 | TinyLlama 1.1B | 1.1B | ~8.3 GB | ❌ |
-| LLaMA 3.2 3B | 3B | ~22.5 GB | ❌ |
+| **LLaMA 3.2 3B** | **3B** | **~22.5 GB** | **❌ (full FT)** |
 
-So **LLaMA 3B cannot be fully fine-tuned on 4GB VRAM** (weights alone are 6GB). For true
-whole-model fine-tuning, use a small model:
+**But this project uses QLoRA — and it works on 4GB.** QLoRA keeps the base model
+frozen (8-bit quantized, ~3GB) and only trains small LoRA adapter matrices (~few MB).
+That's how LLaMA 3.2 3B fits on an RTX 3050. The table above applies to *full*
+fine-tuning only — not to the QLoRA approach used here.
+
+### Full Fine-Tuning (for small models only)
+
+If you still want to do full (whole-model) fine-tuning on 4GB, use a small model:
 
 ```bash
 python train_full.py                                          # full fine-tune gpt2 (default)
@@ -85,6 +93,23 @@ python inference_qlora.py --full ./gpt2-full-ft-out "What projects have you buil
 **Projects** — WebForge (CrewAI multi-agent), LUMINA (LLaMA 3.1 70B), Data Viz Platform (React+Flask+TF), Spam Classifier (97.67%), AI Chatbot (Flask+MongoDB), ChatNova (Android), SEcureX (blockchain), FACE_RECOGNIZATION (OpenCV), Quantum Computing, HAL internship, Crop Prediction, Traffic Dashboard, and 30+ more  
 **Skills** — Python, Java, JavaScript, TypeScript, C#, Solidity, TensorFlow, PyTorch, scikit-learn, OpenCV, React, Flask, Node.js, AWS, GCP, Docker, Git  
 **Hackathons** — Pack Hack (24h, quantum-resistant cryptography with Kyber+AES-256)
+
+## Persona Learning
+
+The dataset is structured so the model learns a **first-person persona**, not just facts.
+Every output is written as if Srihari is speaking directly:
+
+```
+"### Instruction:\nWho are you?\n\n### Response:\nI'm Srihari R, an aspiring AI Engineer
+and Machine Learning Specialist currently pursuing my B.Tech at Presidency University..."
+```
+
+After fine-tuning, the model adopts this voice. Ask "What projects have you built?" and
+it responds with "I built WebForge..." — not "Srihari built WebForge...". The model
+learns **how** to say things, not just **what** to say.
+
+To adapt this for your own persona, replace `srihari_dataset.json` with your own Q&A
+pairs following the same `instruction` / `input` / `output` format.
 
 ## Troubleshooting
 
